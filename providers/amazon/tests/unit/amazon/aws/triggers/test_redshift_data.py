@@ -151,3 +151,48 @@ class TestRedshiftDataTrigger:
         task = [i async for i in trigger.run()]
         assert len(task) == 1
         assert TriggerEvent(expected_response) in task
+
+    @pytest.mark.asyncio
+    @mock.patch("asyncio.sleep")
+    @mock.patch(
+        "airflow.providers.amazon.aws.hooks.redshift_data.RedshiftDataHook.check_query_is_finished_async",
+        return_value=True,
+    )
+    @mock.patch(
+        "airflow.providers.amazon.aws.hooks.redshift_data.RedshiftDataHook.is_still_running",
+        side_effect=[True, False],
+    )
+    async def test_redshift_data_trigger_run_multiple_polls(
+        self,
+        mocked_is_still_running,
+        mock_check_query_is_finished_async,
+        mock_sleep,
+    ):
+        """
+        Tests that RedshiftDataTrigger correctly handles multiple poll cycles
+        where is_still_running returns True multiple times before returning False.
+
+        This test verifies the regression gap created by PR #66157's control flow rewrite.
+        The previous while await form made multi-poll behavior hard to test; the new
+        while True + if-not-break form needs explicit testing to catch silent future regressions.
+        """
+        trigger = RedshiftDataTrigger(
+            statement_id="uuid",
+            task_id=TEST_TASK_ID,
+            poll_interval=POLL_INTERVAL,
+            aws_conn_id=TEST_CONN_ID,
+        )
+
+        generator = trigger.run()
+        response = await generator.asend(None)
+
+        # Verify is_still_running was called twice: first True (continue polling), then False (break)
+        assert mocked_is_still_running.call_count == 2
+
+        # Verify asyncio.sleep was called once (between the two polls)
+        assert mock_sleep.call_count == 1
+
+        # Verify a single TriggerEvent was emitted with success status
+        assert response == TriggerEvent(
+            {"status": "success", "statement_id": "uuid"}
+        )
